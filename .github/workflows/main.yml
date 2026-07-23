@@ -1,0 +1,52 @@
+name: Scheduled HCP Terraform Run
+
+on:
+  schedule:
+    # Runs EVERY Monday at 09:00 UTC
+    - cron: '0 9 * * 1'
+  # Allows you to trigger this manually from the UI anytime
+  workflow_dispatch: 
+
+jobs:
+  trigger-workspace:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if First or Third Monday
+        id: check_monday
+        run: |
+          # Get the current day of the month (1-31)
+          DAY_OF_MONTH=$(date +%-d)
+          
+          # First Monday: days 1-7. Third Monday: days 15-21.
+          if [[ $DAY_OF_MONTH -le 7 ]] || [[ $DAY_OF_MONTH -ge 15 && $DAY_OF_MONTH -le 21 ]]; then
+            echo "This is the first or third Monday. Proceeding."
+            echo "run_job=true" >> $GITHUB_OUTPUT
+          else
+            echo "Not the first or third Monday. Skipping."
+            echo "run_job=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Trigger HCP Workspace Run
+        # Run if the bash script passed, OR if you clicked "Run workflow" manually
+        if: steps.check_monday.outputs.run_job == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          curl --request POST \
+            --header "Authorization: Bearer ${{ secrets.HCP_API_TOKEN }}" \
+            --header "Content-Type: application/vnd.api+json" \
+            --data '{
+              "data": {
+                "attributes": {
+                  "message": "Automated 1st/3rd Monday run via GitHub Actions"
+                },
+                "type": "runs",
+                "relationships": {
+                  "workspace": {
+                    "data": {
+                      "type": "workspaces",
+                      "id": "${{ secrets.HCP_WORKSPACE_ID }}"
+                    }
+                  }
+                }
+              }
+            }' \
+            https://app.terraform.io/api/v2/runs
