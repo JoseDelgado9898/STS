@@ -6,7 +6,7 @@ resource "azurerm_virtual_network" "this" {
   resource_group_name = local.vnet_resource_group_name
   address_space       = [var.cidr]
   tags                = var.tags
-  depends_on          = [azurerm_resource_group.vnet_resource_group[0]]
+  depends_on          = [azurerm_resource_group.vnet_resource_group]
 }
 
 resource "azurerm_resource_group" "vnet_resource_group" {
@@ -30,8 +30,8 @@ data "azurerm_resource_group" "existing_vnet_resource_group" {
 
 locals {
   network_prefix      = local.workspace_name
-  vnet                = var.create_new_vnet ? azurerm_virtual_network.this[0] : data.azurerm_virtual_network.existing[0]
-  vnet_resource_group = var.create_new_vnet ? azurerm_resource_group.vnet_resource_group[0] : data.azurerm_resource_group.existing_vnet_resource_group[0]
+  vnet                = var.create_new_vnet ? one(azurerm_virtual_network.this) : one(data.azurerm_virtual_network.existing)
+  vnet_resource_group = var.create_new_vnet ? one(azurerm_resource_group.vnet_resource_group) : one(data.azurerm_resource_group.existing_vnet_resource_group)
 }
 
 # other network resources
