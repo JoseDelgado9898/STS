@@ -57,12 +57,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TF_WORKING_DIR: workspace-setup/terraform-examples/azure/azure-vnet-injection-uc/tf
-      # HCP targeting for the CLI-driven run. Add these as repo secrets:
-      #   TF_CLOUD_ORGANIZATION  – your HCP org name
-      #   HCP_WORKSPACE_NAME     – the workspace NAME (e.g. azure-vnet-injection-uc),
-      #                            NOT the ws-… ID; the cloud integration keys on name.
-      TF_CLOUD_ORGANIZATION: ${{ secrets.TF_CLOUD_ORGANIZATION }}
-      TF_WORKSPACE: ${{ secrets.HCP_WORKSPACE_NAME }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -76,12 +70,40 @@ jobs:
           terraform_version: "1.15.8"
           cli_config_credentials_token: ${{ secrets.HCP_API_TOKEN }}
 
+      - name: Resolve HCP org + workspace name from the workspace ID
+        # The cloud integration keys on org + workspace NAME, but we only store
+        # the ws-… ID. Derive both from the existing secrets via the HCP API so
+        # no extra secrets are needed. Exported to $GITHUB_ENV for later steps.
+        env:
+          HCP_API_TOKEN: ${{ secrets.HCP_API_TOKEN }}
+          HCP_WORKSPACE_ID: ${{ secrets.HCP_WORKSPACE_ID }}
+        run: |
+          set -euo pipefail
+          resp=$(curl -s -w $'\n%{http_code}' \
+            --header "Authorization: Bearer ${HCP_API_TOKEN}" \
+            --header "Content-Type: application/vnd.api+json" \
+            "https://app.terraform.io/api/v2/workspaces/${HCP_WORKSPACE_ID}")
+          code=$(printf '%s' "$resp" | tail -n1)
+          body=$(printf '%s' "$resp" | sed '$d')
+          if [[ "$code" != "200" ]]; then
+            echo "::error::HCP API returned HTTP $code resolving ${HCP_WORKSPACE_ID}"; echo "$body"; exit 1
+          fi
+          # In the HCP/TFC API the organization's "id" is its name.
+          org=$(printf '%s' "$body" | jq -r '.data.relationships.organization.data.id')
+          ws=$(printf '%s' "$body" | jq -r '.data.attributes.name')
+          if [[ -z "$org" || "$org" == "null" || -z "$ws" || "$ws" == "null" ]]; then
+            echo "::error::Could not parse org/workspace name from HCP response"; echo "$body"; exit 1
+          fi
+          echo "Resolved org='${org}' workspace='${ws}'"
+          echo "TF_CLOUD_ORGANIZATION=${org}" >> "$GITHUB_ENV"
+          echo "TF_WORKSPACE=${ws}" >> "$GITHUB_ENV"
+
       - name: Point the CLI at the HCP workspace
         working-directory: ${{ env.TF_WORKING_DIR }}
         run: |
           # Generated only on the runner (never committed), so VCS-ingressed runs
           # of this module are unaffected. Org + workspace come from the
-          # TF_CLOUD_ORGANIZATION / TF_WORKSPACE env vars above.
+          # TF_CLOUD_ORGANIZATION / TF_WORKSPACE env vars set by the resolve step.
           cat > zz_ci_cloud.tf <<'EOF'
           terraform {
             cloud {}
