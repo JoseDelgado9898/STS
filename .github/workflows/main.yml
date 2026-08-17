@@ -8,18 +8,24 @@ name: Scheduled HCP Terraform Reset + Apply
 # refresh deadlocks trying to authenticate against the dead workspace.
 #
 # This job breaks that deadlock on each scheduled run:
-#   1. `state rm` the 4 resources managed by the dead-host provider. State ops
-#      never configure a provider, so this works with no databricks auth.
-#   2. `destroy -refresh=false` — tears down the surviving-but-broken metastore
-#      (force_destroy cascades and cleans the orphaned UC objects) plus the
-#      account-level resources, via the accounts + azurerm providers (which
-#      authenticate fine). -refresh=false stops the 2 default-provider data
-#      sources from being re-read against the dead host.
-#   3. `apply` — greenfield rebuild. A new random_id suffix + a fresh metastore
-#      (existing_metastore_id="") means zero name/region collisions.
+#   1. `state rm` (CLI) the resources managed by the dead-host provider plus the
+#      dead-workspace account assignments. State ops never configure a provider,
+#      so they work with no databricks auth — and they ARE permitted on a
+#      VCS-connected workspace.
+#   2. A VCS-driven DESTROY run (is-destroy + refresh=false, via the HCP API) —
+#      tears down the surviving-but-broken metastore (force_destroy cascades and
+#      cleans the orphaned UC objects) plus the account-level resources, via the
+#      accounts + azurerm providers (which authenticate fine).
+#   3. A VCS-driven APPLY run — greenfield rebuild. A new random_id suffix + a
+#      fresh metastore (existing_metastore_id="") means zero name/region
+#      collisions.
 #
-# Destroy + apply execute as REMOTE runs in HCP, so the Azure/Databricks
-# credentials stay in the workspace — the runner only needs the HCP token.
+# NOTE: this workspace is VCS-connected, so HCP forbids CLI/API-driven applies
+# ("Apply not allowed for workspaces with a VCS connection"). Destroy + apply
+# therefore run as VCS-driven runs triggered through the API (the same path the
+# original workflow used); only the state surgery uses the CLI. Everything
+# executes in HCP, so cloud creds stay in the workspace — the runner only needs
+# the HCP token.
 # ---------------------------------------------------------------------------
 
 on:
@@ -118,29 +124,79 @@ jobs:
         working-directory: ${{ env.TF_WORKING_DIR }}
         run: |
           set -euo pipefail
+          # The first 4 are managed by the default (dead-host) databricks provider
+          # and would deadlock any refresh/destroy. The last 2 are account-level
+          # assignments bound to the wiped workspace_id — forgetting them avoids a
+          # 404-on-delete during the destroy run (the workspace they point at is
+          # gone, so they are already cleared in reality). This job only runs
+          # post-wipe, so removing them is always correct here.
           for addr in \
             'databricks_cluster.uc_single_node[0]' \
             'databricks_catalog.uc_quickstart_sandbox' \
             'databricks_external_location.db_ext_loc' \
-            'databricks_storage_credential.db_uc_storage_cred'; do
+            'databricks_storage_credential.db_uc_storage_cred' \
+            'databricks_mws_permission_assignment.workspace_access' \
+            'databricks_metastore_assignment.this'; do
             terraform state rm "$addr" || echo "  (not in state — skipping $addr)"
           done
-          # If the account-level assignment/permission deletes error against the
-          # dead workspace_id during destroy, forget them here too (they belong to
-          # a workspace that no longer exists) and re-run:
-          # terraform state rm databricks_mws_permission_assignment.workspace_access || true
-          # terraform state rm databricks_metastore_assignment.this || true
 
-      - name: Destroy survivors (metastore force_destroy cascades UC cleanup)
-        working-directory: ${{ env.TF_WORKING_DIR }}
+      # This workspace is VCS-connected, so HCP rejects CLI/API-driven applies
+      # ("Apply not allowed for workspaces with a VCS connection"). The allowed
+      # path is a VCS-driven run triggered via the API — which is what the old
+      # workflow already used. So the destroy + greenfield apply run as API runs
+      # (against the latest VCS config), while only the state surgery above uses
+      # the CLI (state ops ARE permitted on VCS workspaces).
+      - name: Destroy survivors, then greenfield apply (VCS-driven API runs)
+        env:
+          HCP_API_TOKEN: ${{ secrets.HCP_API_TOKEN }}
+          HCP_WORKSPACE_ID: ${{ secrets.HCP_WORKSPACE_ID }}
         run: |
           set -euo pipefail
-          if terraform state list | grep -q .; then
-            terraform destroy -refresh=false -auto-approve -input=false
-          else
-            echo "State already empty — nothing to destroy."
-          fi
+          api="https://app.terraform.io/api/v2"
+          auth=(-H "Authorization: Bearer ${HCP_API_TOKEN}" -H "Content-Type: application/vnd.api+json")
 
-      - name: Apply greenfield (fresh metastore + new random suffix)
-        working-directory: ${{ env.TF_WORKING_DIR }}
-        run: terraform apply -auto-approve -input=false
+          # Create a run and block until it reaches a terminal state.
+          # $1 = label, $2 = JSON payload
+          run_and_wait() {
+            local label="$1" payload="$2" rid st attempts=0 applied_posted=0
+            rid=$(curl -sf "${auth[@]}" -X POST -d "$payload" "$api/runs" | jq -r '.data.id')
+            if [[ -z "$rid" || "$rid" == "null" ]]; then
+              echo "::error::$label: run was not created"; exit 1
+            fi
+            echo "$label run: $rid"
+            echo "  https://app.terraform.io/app/${TF_CLOUD_ORGANIZATION}/workspaces/${TF_WORKSPACE}/runs/$rid"
+            while true; do
+              sleep 15
+              attempts=$((attempts + 1))
+              st=$(curl -sf "${auth[@]}" "$api/runs/$rid" | jq -r '.data.attributes.status' || echo "unknown")
+              echo "  [$label] status: $st"
+              case "$st" in
+                applied|planned_and_finished)
+                  echo "  [$label] complete ($st)"; return 0 ;;
+                errored|canceled|force_canceled|discarded|policy_soft_failed)
+                  echo "::error::$label ended in state: $st"; exit 1 ;;
+                planned)
+                  # Auto-apply not honored (workspace setting off) — confirm once.
+                  if [[ "$applied_posted" == "0" ]]; then
+                    echo "  [$label] plan finished; confirming apply"
+                    curl -sf "${auth[@]}" -X POST -d '{"comment":"CI auto-apply"}' \
+                      "$api/runs/$rid/actions/apply" || true
+                    applied_posted=1
+                  fi ;;
+              esac
+              if [[ "$attempts" -ge 240 ]]; then   # ~60 min ceiling
+                echo "::error::$label timed out after ~60m (last status: $st)"; exit 1
+              fi
+            done
+          }
+
+          # is-destroy + refresh=false: the 4 dead-host resources are already out
+          # of state, so nothing configures the dead provider; the metastore's
+          # force_destroy cascades and cleans the orphaned UC objects.
+          destroy_payload=$(jq -n --arg ws "$HCP_WORKSPACE_ID" \
+            '{data:{type:"runs","attributes":{"message":"CI biweekly reset: destroy survivors","is-destroy":true,"refresh":false,"auto-apply":true},"relationships":{"workspace":{"data":{"type":"workspaces","id":$ws}}}}}')
+          apply_payload=$(jq -n --arg ws "$HCP_WORKSPACE_ID" \
+            '{data:{type:"runs","attributes":{"message":"CI biweekly reset: greenfield apply","auto-apply":true},"relationships":{"workspace":{"data":{"type":"workspaces","id":$ws}}}}}')
+
+          run_and_wait "destroy" "$destroy_payload"
+          run_and_wait "apply"   "$apply_payload"
