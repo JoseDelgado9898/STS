@@ -1,52 +1,124 @@
-name: Scheduled HCP Terraform Run
+name: Scheduled HCP Terraform Reset + Apply
+
+# ---------------------------------------------------------------------------
+# The Azure infra behind this workspace is wiped externally every two weeks, so
+# the HCP state ends up pointing at a Databricks workspace that no longer
+# exists. The default `databricks` provider takes its host from
+# azurerm_databricks_workspace.this.workspace_url, so ANY normal plan/apply/
+# refresh deadlocks trying to authenticate against the dead workspace.
+#
+# This job breaks that deadlock on each scheduled run:
+#   1. `state rm` the 4 resources managed by the dead-host provider. State ops
+#      never configure a provider, so this works with no databricks auth.
+#   2. `destroy -refresh=false` — tears down the surviving-but-broken metastore
+#      (force_destroy cascades and cleans the orphaned UC objects) plus the
+#      account-level resources, via the accounts + azurerm providers (which
+#      authenticate fine). -refresh=false stops the 2 default-provider data
+#      sources from being re-read against the dead host.
+#   3. `apply` — greenfield rebuild. A new random_id suffix + a fresh metastore
+#      (existing_metastore_id="") means zero name/region collisions.
+#
+# Destroy + apply execute as REMOTE runs in HCP, so the Azure/Databricks
+# credentials stay in the workspace — the runner only needs the HCP token.
+# ---------------------------------------------------------------------------
 
 on:
   schedule:
-    # Runs EVERY Monday at 09:00 UTC
+    # Runs EVERY Monday at 09:00 UTC; the gate below narrows it to 1st/3rd.
     - cron: '0 9 * * 1'
   # Allows you to trigger this manually from the UI anytime
-  workflow_dispatch: 
+  workflow_dispatch:
 
 jobs:
-  trigger-workspace:
+  gate:
     runs-on: ubuntu-latest
+    outputs:
+      run_job: ${{ steps.check_monday.outputs.run_job }}
     steps:
       - name: Check if First or Third Monday
         id: check_monday
         run: |
           # Get the current day of the month (1-31)
           DAY_OF_MONTH=$(date +%-d)
-          
+
           # First Monday: days 1-7. Third Monday: days 15-21.
           if [[ $DAY_OF_MONTH -le 7 ]] || [[ $DAY_OF_MONTH -ge 15 && $DAY_OF_MONTH -le 21 ]]; then
             echo "This is the first or third Monday. Proceeding."
-            echo "run_job=true" >> $GITHUB_OUTPUT
+            echo "run_job=true" >> "$GITHUB_OUTPUT"
           else
             echo "Not the first or third Monday. Skipping."
-            echo "run_job=false" >> $GITHUB_OUTPUT
+            echo "run_job=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Trigger HCP Workspace Run
-        # Run if the bash script passed, OR if you clicked "Run workflow" manually
-        if: steps.check_monday.outputs.run_job == 'true' || github.event_name == 'workflow_dispatch'
+  reset-and-apply:
+    needs: gate
+    # Run on the 1st/3rd Monday, OR whenever triggered manually.
+    if: needs.gate.outputs.run_job == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      TF_WORKING_DIR: workspace-setup/terraform-examples/azure/azure-vnet-injection-uc/tf
+      # HCP targeting for the CLI-driven run. Add these as repo secrets:
+      #   TF_CLOUD_ORGANIZATION  – your HCP org name
+      #   HCP_WORKSPACE_NAME     – the workspace NAME (e.g. azure-vnet-injection-uc),
+      #                            NOT the ws-… ID; the cloud integration keys on name.
+      TF_CLOUD_ORGANIZATION: ${{ secrets.TF_CLOUD_ORGANIZATION }}
+      TF_WORKSPACE: ${{ secrets.HCP_WORKSPACE_NAME }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          # Match the HCP workspace's Terraform version so the LOCAL `state rm`
+          # reads/writes the remote state cleanly. Keep this in sync with the
+          # workspace's configured version.
+          terraform_version: "1.15.8"
+          cli_config_credentials_token: ${{ secrets.HCP_API_TOKEN }}
+
+      - name: Point the CLI at the HCP workspace
+        working-directory: ${{ env.TF_WORKING_DIR }}
         run: |
-          curl --request POST \
-            --header "Authorization: Bearer ${{ secrets.HCP_API_TOKEN }}" \
-            --header "Content-Type: application/vnd.api+json" \
-            --data '{
-              "data": {
-                "attributes": {
-                  "message": "Automated 1st/3rd Monday run via GitHub Actions"
-                },
-                "type": "runs",
-                "relationships": {
-                  "workspace": {
-                    "data": {
-                      "type": "workspaces",
-                      "id": "${{ secrets.HCP_WORKSPACE_ID }}"
-                    }
-                  }
-                }
-              }
-            }' \
-            https://app.terraform.io/api/v2/runs
+          # Generated only on the runner (never committed), so VCS-ingressed runs
+          # of this module are unaffected. Org + workspace come from the
+          # TF_CLOUD_ORGANIZATION / TF_WORKSPACE env vars above.
+          cat > zz_ci_cloud.tf <<'EOF'
+          terraform {
+            cloud {}
+          }
+          EOF
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init -input=false
+
+      - name: Forget dead-host resources (state-only; no provider auth)
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          set -euo pipefail
+          for addr in \
+            'databricks_cluster.uc_single_node[0]' \
+            'databricks_catalog.uc_quickstart_sandbox' \
+            'databricks_external_location.db_ext_loc' \
+            'databricks_storage_credential.db_uc_storage_cred'; do
+            terraform state rm "$addr" || echo "  (not in state — skipping $addr)"
+          done
+          # If the account-level assignment/permission deletes error against the
+          # dead workspace_id during destroy, forget them here too (they belong to
+          # a workspace that no longer exists) and re-run:
+          # terraform state rm databricks_mws_permission_assignment.workspace_access || true
+          # terraform state rm databricks_metastore_assignment.this || true
+
+      - name: Destroy survivors (metastore force_destroy cascades UC cleanup)
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          set -euo pipefail
+          if terraform state list | grep -q .; then
+            terraform destroy -refresh=false -auto-approve -input=false
+          else
+            echo "State already empty — nothing to destroy."
+          fi
+
+      - name: Apply greenfield (fresh metastore + new random suffix)
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -auto-approve -input=false
